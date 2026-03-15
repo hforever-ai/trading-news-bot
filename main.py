@@ -1,13 +1,38 @@
-import feedparser, requests, time, hashlib, json, os
-from xml.etree import ElementTree as ET
-from datetime import datetime
+"""
+Trading News Bot v2 — API-First Architecture
+=============================================
+Sources: Finnhub (primary), NewsAPI (secondary), Polygon.io (tertiary)
+No RSS feeds. Real-time API polling with smart dedup.
+
+Deploy on Railway with these env vars:
+  TELEGRAM_TOKEN, TELEGRAM_CHAT,
+  FINNHUB_KEY, NEWSAPI_KEY, POLYGON_KEY  (at least one required)
+"""
+
+import requests
+import time
+import hashlib
+import json
+import os
+import re
+from datetime import datetime, timedelta, timezone
+from difflib import SequenceMatcher
 
 # ─── CONFIG ─────────────────────────────────────────────────────────
-# Set these as environment variables on your host (Heroku, Railway, etc.)
-# Falls back to hardcoded values if env vars not set.
-TOKEN = os.environ.get('TELEGRAM_TOKEN', '8635295437:AAEXsu4d4gceAVNqHicQ5Jfb36lI6Yqw1tI')
-CHAT  = os.environ.get('TELEGRAM_CHAT',  '846560537')
-BZ    = os.environ.get('BENZINGA_KEY',    'bz.FSQEII7ABTQXIPTILNMZLGCKXEJPWFYH')
+TOKEN = os.environ.get('TELEGRAM_TOKEN', '')
+CHAT  = os.environ.get('TELEGRAM_CHAT', '')
+
+# API Keys — bot works with ANY combination (at least 1 needed)
+FINNHUB_KEY  = os.environ.get('FINNHUB_KEY', '')     # Free: 60 calls/min
+NEWSAPI_KEY  = os.environ.get('NEWSAPI_KEY', '')      # Free: 100 calls/day
+POLYGON_KEY  = os.environ.get('POLYGON_KEY', '')      # Free: 5 calls/min
+
+# ─── TIMING (seconds) ──────────────────────────────────────────────
+FINNHUB_INTERVAL  = 30     # Poll Finnhub every 30s
+NEWSAPI_INTERVAL  = 300    # Poll NewsAPI every 5 min (save daily quota)
+POLYGON_INTERVAL  = 120    # Poll Polygon every 2 min
+FIIDII_HOUR_UTC   = 10     # 4:00 PM IST = 10:30 UTC
+FIIDII_MINUTE_UTC = 30
 
 # ─── KEYWORDS (US + Indian Markets) ────────────────────────────────
 KEYWORDS = [
@@ -33,34 +58,18 @@ KEYWORDS = [
     'gold price', 'bond yield', 'dollar index',
 ]
 
-# ─── RSS FEEDS (Verified Working — US + India) ─────────────────────
-FEEDS = {
-    # ── US Sources ──
-    'CNBC Business'   : 'https://www.cnbc.com/id/10001147/device/rss/rss.html',
-    'CNBC Economy'    : 'https://www.cnbc.com/id/20910258/device/rss/rss.html',
-    'CNBC Earnings'   : 'https://www.cnbc.com/id/15839135/device/rss/rss.html',
-    'MarketWatch'     : 'https://feeds.marketwatch.com/marketwatch/topstories/',
-    'Nasdaq'          : 'https://www.nasdaq.com/feed/nasdaq-original/rss.xml',
-    'Investing.com'   : 'https://www.investing.com/rss/news.rss',
-    'Seeking Alpha'   : 'https://seekingalpha.com/feed.xml',
-    'Benzinga'        : 'https://feeds.benzinga.com/benzinga',
-    'TheStreet'       : 'https://www.thestreet.com/.rss/full',
-    'Motley Fool'     : 'https://www.fool.com/a/feeds/partner/google-news-feed/article/.aspx',
-    'Fed Reserve'     : 'https://www.federalreserve.gov/feeds/press_all.xml',
-    # ── India Sources ──
-    'ET Markets'      : 'https://economictimes.indiatimes.com/markets/rssfeeds/1977021501.cms',
-    'Moneycontrol'    : 'https://www.moneycontrol.com/rss/MCtopnews.xml',
-    'Business Std'    : 'https://www.business-standard.com/rss/markets-106.rss',
-    'Hindu BizLine'   : 'https://www.thehindubusinessline.com/markets/feeder/default.rss',
-    'Livemint Markets': 'https://www.livemint.com/rss/markets',
-}
+# Tickers to track on Finnhub (batched to stay within rate limits)
+US_TICKERS = ['AAPL', 'MSFT', 'GOOGL', 'AMZN', 'TSLA', 'NVDA', 'META', 'SPY', 'QQQ']
+INDIA_SYMBOLS = ['RELIANCE', 'TCS', 'INFY', 'HDFCBANK', 'ICICIBANK', 'ADANIENT', 'TATAMOTORS', 'SBIN']
 
-# ─── PERSISTENT DEDUP (survives restarts) ──────────────────────────
-SEEN_FILE = 'seen_hashes.json'
-MAX_SEEN  = 5000  # cap to avoid unbounded file growth
+# ─── DEDUP ENGINE ──────────────────────────────────────────────────
+SEEN_FILE   = 'seen_hashes.json'
+MAX_SEEN    = 8000
+TITLE_CACHE = []           # recent titles for fuzzy matching
+MAX_TITLE_CACHE = 500
+SIMILARITY_THRESHOLD = 0.82  # titles >82% similar = duplicate
 
-def load_seen():
-    """Load seen hashes from disk so restarts don't re-send old news."""
+def load_seen() -> set:
     try:
         with open(SEEN_FILE, 'r') as f:
             data = json.load(f)
@@ -68,8 +77,7 @@ def load_seen():
     except (FileNotFoundError, json.JSONDecodeError):
         return set()
 
-def save_seen(seen_set):
-    """Persist seen hashes to disk."""
+def save_seen(seen_set: set):
     hashes = list(seen_set)
     if len(hashes) > MAX_SEEN:
         hashes = hashes[-MAX_SEEN:]
@@ -77,101 +85,348 @@ def save_seen(seen_set):
         with open(SEEN_FILE, 'w') as f:
             json.dump({'hashes': hashes, 'updated': datetime.now().isoformat()}, f)
     except Exception as e:
-        print(f'Save seen err: {e}', flush=True)
+        log(f'Save seen err: {e}')
 
 seen = load_seen()
 
-# ─── TELEGRAM ──────────────────────────────────────────────────────
-def tg(msg):
-    """Send a message to Telegram with retry and rate-limit handling."""
-    for attempt in range(2):
-        try:
-            r = requests.post(
-                f'https://api.telegram.org/bot{TOKEN}/sendMessage',
-                json={'chat_id': CHAT, 'text': msg, 'disable_web_page_preview': True},
-                timeout=15,
-            )
-            if r.status_code == 429:
-                retry_after = r.json().get('parameters', {}).get('retry_after', 5)
-                print(f'TG rate limited, waiting {retry_after}s', flush=True)
-                time.sleep(retry_after)
-                continue
-            return
-        except Exception as e:
-            print(f'TG err (attempt {attempt+1}): {e}', flush=True)
-            time.sleep(2)
+def make_hash(title: str, url: str = '') -> str:
+    """Create dedup hash from normalized title + url."""
+    clean = re.sub(r'\s+', ' ', title.strip().lower())
+    return hashlib.md5((clean + url).encode()).hexdigest()
 
-def matches_keywords(title):
-    """Check if title contains any keyword (case-insensitive)."""
+def is_fuzzy_duplicate(title: str) -> bool:
+    """Check if title is too similar to a recently sent headline."""
+    clean = re.sub(r'\s+', ' ', title.strip().lower())
+    for cached in TITLE_CACHE[-MAX_TITLE_CACHE:]:
+        if SequenceMatcher(None, clean, cached).ratio() > SIMILARITY_THRESHOLD:
+            return True
+    return False
+
+def mark_sent(title: str, h: str):
+    """Mark a headline as sent (hash + title cache)."""
+    seen.add(h)
+    clean = re.sub(r'\s+', ' ', title.strip().lower())
+    TITLE_CACHE.append(clean)
+    if len(TITLE_CACHE) > MAX_TITLE_CACHE:
+        TITLE_CACHE.pop(0)
+
+# ─── KEYWORD MATCHER ───────────────────────────────────────────────
+def matches_keywords(title: str) -> bool:
     t = title.lower()
     return any(kw in t for kw in KEYWORDS)
 
-# ─── RSS FETCHER ───────────────────────────────────────────────────
-def fetch_rss():
-    """Fetch all RSS feeds and send matching, unseen headlines."""
-    global seen
-    new_count = 0
-    for src, url in FEEDS.items():
+def categorize(title: str) -> str:
+    """Return an emoji category tag for the headline."""
+    t = title.lower()
+    if any(k in t for k in ['nifty', 'sensex', 'bse', 'nse', 'rbi', 'sebi', 'fii', 'dii', 'rupee',
+                             'adani', 'reliance', 'tata', 'infosys', 'hdfc', 'icici']):
+        return '🇮🇳'
+    if any(k in t for k in ['fed', 'fomc', 'nasdaq', 'dow', 's&p', 'nyse', 'treasury', 'wall street']):
+        return '🇺🇸'
+    if any(k in t for k in ['earnings', 'quarterly results', 'revenue', 'profit', 'eps']):
+        return '💰'
+    if any(k in t for k in ['ipo', 'merger', 'acquisition', 'takeover', 'buyout']):
+        return '🤝'
+    if any(k in t for k in ['crash', 'plunge', 'selloff', 'sell-off', 'bear']):
+        return '🔴'
+    if any(k in t for k in ['rally', 'surge', 'bull', 'rebound']):
+        return '🟢'
+    if any(k in t for k in ['oil', 'crude', 'gold', 'bond', 'dollar', 'tariff', 'inflation', 'cpi']):
+        return '🌍'
+    return '📰'
+
+# ─── LOGGING ───────────────────────────────────────────────────────
+def log(msg: str):
+    print(f'[{datetime.now().strftime("%H:%M:%S")}] {msg}', flush=True)
+
+# ─── TELEGRAM ──────────────────────────────────────────────────────
+def tg(msg: str):
+    if not TOKEN or not CHAT:
+        log(f'TG not configured. Message: {msg[:80]}...')
+        return
+    for attempt in range(3):
         try:
-            feed = feedparser.parse(url)
-            if feed.bozo and not feed.entries:
-                print(f'{src}: feed error (bozo={feed.bozo_exception})', flush=True)
+            r = requests.post(
+                f'https://api.telegram.org/bot{TOKEN}/sendMessage',
+                json={
+                    'chat_id': CHAT,
+                    'text': msg,
+                    'disable_web_page_preview': True,
+                    'parse_mode': 'HTML',
+                },
+                timeout=15,
+            )
+            if r.status_code == 429:
+                wait = r.json().get('parameters', {}).get('retry_after', 5)
+                log(f'TG rate limited, waiting {wait}s')
+                time.sleep(wait)
                 continue
-
-            for entry in feed.entries[:8]:
-                title = entry.get('title', '').strip()
-                link  = entry.get('link', '').strip()
-                if not title:
-                    continue
-
-                h = hashlib.md5((title + link).encode()).hexdigest()
-                if h in seen:
-                    continue
-
-                # Mark as seen regardless of match (prevents re-checking)
-                seen.add(h)
-
-                if matches_keywords(title):
-                    new_count += 1
-                    tg(f'📰 [{src}]\n{title}\n{link}')
-                    time.sleep(0.5)
-
+            if r.status_code == 200:
+                return
+            log(f'TG HTTP {r.status_code}: {r.text[:100]}')
+            return
         except Exception as e:
-            print(f'{src} err: {e}', flush=True)
+            log(f'TG err (attempt {attempt+1}): {e}')
+            time.sleep(2)
 
-    if new_count > 0:
-        save_seen(seen)
-        print(f'Sent {new_count} new headlines', flush=True)
+def send_headline(source: str, title: str, url: str = '', summary: str = ''):
+    """Format and send a single headline to Telegram."""
+    cat = categorize(title)
+    parts = [f'{cat} <b>[{source}]</b>', title]
+    if summary:
+        parts.append(f'<i>{summary[:200]}</i>')
+    if url:
+        parts.append(url)
+    tg('\n'.join(parts))
+    time.sleep(0.4)  # avoid TG flood
 
-# ─── BENZINGA API FETCHER ──────────────────────────────────────────
-def fetch_benzinga():
-    """Fetch news from Benzinga Pro API."""
-    global seen
+# ═══════════════════════════════════════════════════════════════════
+#  SOURCE 1: FINNHUB  (Primary — fast, high rate limit)
+# ═══════════════════════════════════════════════════════════════════
+
+def fetch_finnhub_general():
+    """Fetch general market news from Finnhub."""
+    if not FINNHUB_KEY:
+        return 0
+    count = 0
     try:
         r = requests.get(
-            'https://api.benzinga.com/api/v2/news',
-            params={'token': BZ, 'pageSize': '10'},
+            'https://finnhub.io/api/v1/news',
+            params={'category': 'general', 'token': FINNHUB_KEY},
             timeout=15,
         )
         if r.status_code != 200:
-            print(f'Benzinga HTTP {r.status_code}', flush=True)
-            return
+            log(f'Finnhub general HTTP {r.status_code}')
+            return 0
 
-        root = ET.fromstring(r.text)
-        for item in root.findall('item'):
-            title = (item.findtext('title') or '').strip()
-            url   = (item.findtext('url') or '').strip()
-            h = hashlib.md5(title.encode()).hexdigest()
-            if h not in seen and matches_keywords(title):
+        articles = r.json()
+        for art in articles[:20]:
+            title   = art.get('headline', '').strip()
+            url     = art.get('url', '')
+            summary = art.get('summary', '')[:200]
+            if not title:
+                continue
+
+            h = make_hash(title, url)
+            if h in seen:
+                continue
+            if is_fuzzy_duplicate(title):
                 seen.add(h)
-                tg(f'📰 [Benzinga Pro]\n{title}\n{url}')
-                time.sleep(0.5)
-    except Exception as e:
-        print(f'Benzinga err: {e}', flush=True)
+                continue
 
-# ─── FII/DII DAILY REPORT ─────────────────────────────────────────
+            if matches_keywords(title):
+                mark_sent(title, h)
+                send_headline('Finnhub', title, url, summary)
+                count += 1
+            else:
+                seen.add(h)  # mark seen even if not matching
+
+    except Exception as e:
+        log(f'Finnhub general err: {e}')
+    return count
+
+def fetch_finnhub_ticker(symbols: list, batch_label: str = ''):
+    """Fetch company-specific news from Finnhub for given symbols."""
+    if not FINNHUB_KEY:
+        return 0
+    count = 0
+    today = datetime.now().strftime('%Y-%m-%d')
+    week_ago = (datetime.now() - timedelta(days=2)).strftime('%Y-%m-%d')
+
+    for sym in symbols:
+        try:
+            r = requests.get(
+                'https://finnhub.io/api/v1/company-news',
+                params={
+                    'symbol': sym,
+                    'from': week_ago,
+                    'to': today,
+                    'token': FINNHUB_KEY,
+                },
+                timeout=15,
+            )
+            if r.status_code != 200:
+                continue
+
+            articles = r.json()
+            for art in articles[:5]:
+                title   = art.get('headline', '').strip()
+                url     = art.get('url', '')
+                summary = art.get('summary', '')[:200]
+                if not title:
+                    continue
+
+                h = make_hash(title, url)
+                if h in seen or is_fuzzy_duplicate(title):
+                    seen.add(h)
+                    continue
+
+                mark_sent(title, h)
+                send_headline(f'Finnhub/{sym}', title, url, summary)
+                count += 1
+
+            time.sleep(0.3)  # pace API calls
+        except Exception as e:
+            log(f'Finnhub ticker {sym} err: {e}')
+    return count
+
+# Batch tickers across cycles to stay within Finnhub free tier
+_finnhub_ticker_cycle = 0
+
+def fetch_finnhub():
+    """Run Finnhub: general news every cycle, tickers batched across 4 cycles."""
+    global _finnhub_ticker_cycle
+    total = fetch_finnhub_general()
+
+    # Rotate through ticker batches: US batch 1, US batch 2, India batch 1, India batch 2
+    batches = [
+        (US_TICKERS[:5],  'US-1'),
+        (US_TICKERS[5:],  'US-2'),
+        (INDIA_SYMBOLS[:4], 'IN-1'),
+        (INDIA_SYMBOLS[4:], 'IN-2'),
+    ]
+    idx = _finnhub_ticker_cycle % len(batches)
+    symbols, label = batches[idx]
+    total += fetch_finnhub_ticker(symbols, label)
+    _finnhub_ticker_cycle += 1
+
+    if total:
+        log(f'Finnhub: sent {total} headlines (ticker batch {label})')
+    return total
+
+
+# ═══════════════════════════════════════════════════════════════════
+#  SOURCE 2: NEWSAPI  (Secondary — broad coverage, lower quota)
+# ═══════════════════════════════════════════════════════════════════
+
+# Rotate queries to maximize coverage within 100/day free limit
+NEWSAPI_QUERIES = [
+    'stock market today',
+    'federal reserve interest rate',
+    'nifty sensex india market',
+    'earnings report quarterly results',
+    'IPO merger acquisition',
+    'oil gold bond yield',
+    'crypto bitcoin ethereum',
+    'tariff trade war sanctions',
+]
+_newsapi_query_idx = 0
+
+def fetch_newsapi():
+    """Fetch headlines from NewsAPI (rotates queries to save quota)."""
+    global _newsapi_query_idx
+    if not NEWSAPI_KEY:
+        return 0
+    count = 0
+    query = NEWSAPI_QUERIES[_newsapi_query_idx % len(NEWSAPI_QUERIES)]
+    _newsapi_query_idx += 1
+
+    try:
+        r = requests.get(
+            'https://newsapi.org/v2/everything',
+            params={
+                'q': query,
+                'sortBy': 'publishedAt',
+                'language': 'en',
+                'pageSize': 10,
+                'apiKey': NEWSAPI_KEY,
+            },
+            timeout=15,
+        )
+        if r.status_code != 200:
+            log(f'NewsAPI HTTP {r.status_code}: {r.text[:100]}')
+            return 0
+
+        data = r.json()
+        for art in data.get('articles', []):
+            title = (art.get('title') or '').strip()
+            url   = art.get('url', '')
+            desc  = (art.get('description') or '')[:200]
+            src   = art.get('source', {}).get('name', 'NewsAPI')
+            if not title or title == '[Removed]':
+                continue
+
+            h = make_hash(title, url)
+            if h in seen or is_fuzzy_duplicate(title):
+                seen.add(h)
+                continue
+
+            mark_sent(title, h)
+            send_headline(f'NewsAPI/{src}', title, url, desc)
+            count += 1
+
+    except Exception as e:
+        log(f'NewsAPI err: {e}')
+
+    if count:
+        log(f'NewsAPI ({query[:30]}): sent {count} headlines')
+    return count
+
+
+# ═══════════════════════════════════════════════════════════════════
+#  SOURCE 3: POLYGON.IO  (Tertiary — ticker-specific, free tier)
+# ═══════════════════════════════════════════════════════════════════
+
+_polygon_ticker_idx = 0
+
+def fetch_polygon():
+    """Fetch ticker news from Polygon.io (rotates tickers to save quota)."""
+    global _polygon_ticker_idx
+    if not POLYGON_KEY:
+        return 0
+    count = 0
+
+    all_tickers = US_TICKERS + INDIA_SYMBOLS
+    ticker = all_tickers[_polygon_ticker_idx % len(all_tickers)]
+    _polygon_ticker_idx += 1
+
+    try:
+        r = requests.get(
+            f'https://api.polygon.io/v2/reference/news',
+            params={
+                'ticker': ticker,
+                'limit': 5,
+                'order': 'desc',
+                'sort': 'published_utc',
+                'apiKey': POLYGON_KEY,
+            },
+            timeout=15,
+        )
+        if r.status_code != 200:
+            log(f'Polygon HTTP {r.status_code}')
+            return 0
+
+        data = r.json()
+        for art in data.get('results', []):
+            title = (art.get('title') or '').strip()
+            url   = art.get('article_url', '')
+            desc  = (art.get('description') or '')[:200]
+            pub   = art.get('publisher', {}).get('name', 'Polygon')
+            if not title:
+                continue
+
+            h = make_hash(title, url)
+            if h in seen or is_fuzzy_duplicate(title):
+                seen.add(h)
+                continue
+
+            mark_sent(title, h)
+            send_headline(f'Polygon/{pub}', title, url, desc)
+            count += 1
+
+    except Exception as e:
+        log(f'Polygon err: {e}')
+
+    if count:
+        log(f'Polygon ({ticker}): sent {count} headlines')
+    return count
+
+
+# ═══════════════════════════════════════════════════════════════════
+#  FII/DII DAILY REPORT  (NSE India scrape)
+# ═══════════════════════════════════════════════════════════════════
+
 def fetch_fiidii():
-    """Scrape NSE India for FII/DII buy-sell data."""
     try:
         headers = {
             'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
@@ -209,87 +464,153 @@ def fetch_fiidii():
             outlook = '🟡 MIXED'
 
         tg(
-            f'📊 FII/DII DAILY REPORT\n'
+            f'📊 <b>FII/DII DAILY REPORT</b>\n'
             f'{datetime.now().strftime("%d %b %Y")}\n\n'
-            f'FII/FPI:\n'
+            f'<b>FII/FPI:</b>\n'
             f'  Buy : ₹{round(fii_buy, 2)} Cr\n'
             f'  Sell: ₹{round(fii_sell, 2)} Cr\n'
             f'  Net : ₹{round(fii_net, 2)} Cr ({fii_dir})\n\n'
-            f'DII:\n'
+            f'<b>DII:</b>\n'
             f'  Buy : ₹{round(dii_buy, 2)} Cr\n'
             f'  Sell: ₹{round(dii_sell, 2)} Cr\n'
             f'  Net : ₹{round(dii_net, 2)} Cr ({dii_dir})\n\n'
-            f'OUTLOOK: {outlook}'
+            f'<b>OUTLOOK:</b> {outlook}'
         )
+        log('FII/DII report sent')
     except Exception as e:
-        print(f'FII/DII err: {e}', flush=True)
+        log(f'FII/DII err: {e}')
 
-# ─── DAILY FEED HEALTH CHECK ──────────────────────────────────────
-def feed_health_check():
-    """Once a day, report which feeds are alive vs dead."""
-    alive, dead = [], []
-    for src, url in FEEDS.items():
-        try:
-            feed = feedparser.parse(url)
-            if feed.entries:
-                alive.append(src)
-            else:
-                dead.append(src)
-        except Exception:
-            dead.append(src)
 
-    msg = f'🩺 Daily Feed Health Check\n\n'
-    msg += f'✅ Working ({len(alive)}):\n' + (', '.join(alive) or 'None')
-    msg += f'\n\n❌ Down ({len(dead)}):\n' + (', '.join(dead) or 'None')
-    tg(msg)
+# ═══════════════════════════════════════════════════════════════════
+#  MAIN LOOP — Multi-source scheduler
+# ═══════════════════════════════════════════════════════════════════
 
-# ─── MAIN LOOP ─────────────────────────────────────────────────────
-if __name__ == '__main__':
-    print('News Bot started!', flush=True)
+def startup_message():
+    """Send bot status on startup."""
+    sources = []
+    if FINNHUB_KEY:
+        sources.append('Finnhub (every 30s)')
+    if NEWSAPI_KEY:
+        sources.append('NewsAPI (every 5min)')
+    if POLYGON_KEY:
+        sources.append('Polygon.io (every 2min)')
+
+    if not sources:
+        log('⚠️  NO API KEYS SET! Set at least one: FINNHUB_KEY, NEWSAPI_KEY, POLYGON_KEY')
+        tg('⚠️ Bot started but NO API keys configured!\nSet env vars: FINNHUB_KEY, NEWSAPI_KEY, POLYGON_KEY')
+        return
+
     tg(
-        '🚀 Market News Bot Started!\n\n'
-        f'📡 Sources: {len(FEEDS)} RSS feeds + Benzinga Pro\n'
-        '🇺🇸 US: CNBC, MarketWatch, Nasdaq, Seeking Alpha,\n'
-        '    TheStreet, Motley Fool, Investing.com, Fed\n'
-        '🇮🇳 India: ET Markets, Moneycontrol, Business Std,\n'
-        '    Hindu BizLine, Livemint\n\n'
-        '📊 FII/DII report daily at 4:00 PM IST\n'
-        '🩺 Feed health check daily at 8:00 AM IST'
+        '🚀 <b>Market News Bot v2 Started!</b>\n\n'
+        f'📡 <b>Sources ({len(sources)}):</b>\n'
+        + '\n'.join(f'  • {s}' for s in sources)
+        + '\n\n'
+        f'🎯 Tracking: {len(US_TICKERS)} US + {len(INDIA_SYMBOLS)} India tickers\n'
+        f'📊 FII/DII report daily at 4:00 PM IST\n'
+        f'🔑 Keywords: {len(KEYWORDS)} active filters\n\n'
+        f'<i>Cold start: first cycle indexes existing headlines without sending.</i>'
     )
 
-    fii_sent    = False
-    health_sent = False
+
+def cold_start():
+    """
+    CRITICAL FIX: On first run, silently index all current headlines
+    so we only send NEW ones from the next cycle onward.
+    This prevents the "spam dump on boot" problem.
+    """
+    global seen
+    if os.path.exists(SEEN_FILE):
+        log('Seen file exists, skipping cold start')
+        return
+
+    log('Cold start: indexing existing headlines (no sends)...')
+    original_tg = globals()['tg']
+
+    # Temporarily disable Telegram sends
+    def noop_tg(msg):
+        pass
+    globals()['tg'] = noop_tg
+
+    # Run all sources once to populate seen set
+    if FINNHUB_KEY:
+        fetch_finnhub()
+        log(f'  Finnhub indexed ({len(seen)} hashes)')
+    if NEWSAPI_KEY:
+        fetch_newsapi()
+        log(f'  NewsAPI indexed ({len(seen)} hashes)')
+    if POLYGON_KEY:
+        fetch_polygon()
+        log(f'  Polygon indexed ({len(seen)} hashes)')
+
+    # Restore Telegram
+    globals()['tg'] = original_tg
+    save_seen(seen)
+    log(f'Cold start done. {len(seen)} headlines indexed.')
+
+
+if __name__ == '__main__':
+    log('News Bot v2 starting...')
+
+    # Validate config
+    if not TOKEN:
+        log('ERROR: TELEGRAM_TOKEN not set!')
+    if not CHAT:
+        log('ERROR: TELEGRAM_CHAT not set!')
+
+    startup_message()
+    cold_start()
+
+    # Track last run times per source
+    last_finnhub  = 0.0
+    last_newsapi  = 0.0
+    last_polygon  = 0.0
+    fii_sent      = False
+    save_counter  = 0
 
     while True:
         try:
-            now = datetime.utcnow()
+            now = time.time()
+            utcnow = datetime.now(timezone.utc)
+            total = 0
 
-            # Fetch news every loop (~60s)
-            fetch_rss()
-            fetch_benzinga()
+            # ── Finnhub: every 30s ──
+            if FINNHUB_KEY and (now - last_finnhub) >= FINNHUB_INTERVAL:
+                last_finnhub = now
+                total += fetch_finnhub()
 
-            # FII/DII at 4:00 PM IST = 10:30 UTC
-            if now.hour == 10 and 30 <= now.minute < 35:
+            # ── NewsAPI: every 5 min ──
+            if NEWSAPI_KEY and (now - last_newsapi) >= NEWSAPI_INTERVAL:
+                last_newsapi = now
+                total += fetch_newsapi()
+
+            # ── Polygon: every 2 min ──
+            if POLYGON_KEY and (now - last_polygon) >= POLYGON_INTERVAL:
+                last_polygon = now
+                total += fetch_polygon()
+
+            # ── FII/DII at 4:00 PM IST (10:30 UTC) ──
+            if utcnow.hour == FIIDII_HOUR_UTC and FIIDII_MINUTE_UTC <= utcnow.minute < FIIDII_MINUTE_UTC + 5:
                 if not fii_sent:
                     fii_sent = True
                     fetch_fiidii()
 
-            # Feed health check at 8:00 AM IST = 2:30 UTC
-            if now.hour == 2 and 30 <= now.minute < 35:
-                if not health_sent:
-                    health_sent = True
-                    feed_health_check()
-
             # Reset daily flags at midnight UTC
-            if now.hour == 0 and now.minute < 5:
-                fii_sent    = False
-                health_sent = False
+            if utcnow.hour == 0 and utcnow.minute < 5:
+                fii_sent = False
 
-            # Save hashes periodically
+            # Save hashes every 5 cycles
+            save_counter += 1
+            if save_counter >= 5:
+                save_seen(seen)
+                save_counter = 0
+
+            # Sleep 10s between checks (sources have their own intervals)
+            time.sleep(10)
+
+        except KeyboardInterrupt:
+            log('Shutting down...')
             save_seen(seen)
-
-            time.sleep(60)
-
+            break
         except Exception as e:
-            print(f'Main loop err: {e}', flush=True)
+            log(f'Main loop err: {e}')
             time.sleep(30)

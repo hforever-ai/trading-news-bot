@@ -1,68 +1,54 @@
-# 📰 Trading News Bot
+# Trading News Bot v2 — API-First Architecture
 
-A Telegram bot that monitors 16+ financial news sources and pushes real-time alerts for US and Indian markets.
+Real-time market news delivered to your Telegram. Uses **APIs, not RSS feeds**.
 
-## Features
+## Sources
 
-- **16 RSS Feeds** — CNBC, MarketWatch, Nasdaq, Seeking Alpha, TheStreet, Motley Fool, Investing.com, Fed Reserve, ET Markets, Moneycontrol, Business Standard, Hindu BizLine, Livemint + Benzinga Pro API
-- **Smart Keyword Filtering** — 60+ keywords covering US markets, Indian markets, macro, and corporate activity
-- **Persistent Dedup** — Seen headlines saved to disk, so restarts don't re-send old news
-- **FII/DII Daily Report** — Institutional investor data from NSE at 4:00 PM IST
-- **Daily Health Check** — Reports which feeds are alive vs down at 8:00 AM IST
-- **Rate-limit Handling** — Respects Telegram API limits with backoff
+| Source | Free Tier | Poll Rate | What It Covers |
+|--------|-----------|-----------|----------------|
+| **Finnhub** | 60 calls/min | Every 30s | General market news + ticker-specific |
+| **NewsAPI** | 100 calls/day | Every 5 min | Broad news search across thousands of sources |
+| **Polygon.io** | 5 calls/min | Every 2 min | Ticker-specific news, SEC filings |
+
+**You need at least 1 API key.** More sources = better coverage.
+
+## What's Fixed vs v1
+
+- **No more spam on boot** — Cold start silently indexes existing headlines, only sends NEW ones
+- **No RSS** — Pure API-based, faster and more reliable
+- **Fuzzy dedup** — Similar headlines from different sources won't double-send (82% similarity threshold)
+- **Smart batching** — Tickers rotate across cycles to stay within free tier limits
+- **Categorized news** — Headlines tagged with 🇺🇸 🇮🇳 💰 🟢 🔴 🌍 etc.
+- **Persistent dedup** — Survives Railway restarts via file-based seen set
+- **Proper scheduling** — Each source polls at its own optimal interval
 
 ## Setup
 
-### 1. Environment Variables
+### 1. Get Free API Keys
 
-Set these on your host (recommended) or edit the fallback values in `main.py`:
+- **Finnhub** (recommended): https://finnhub.io/register → free key, 60 calls/min
+- **NewsAPI**: https://newsapi.org/register → free key, 100 calls/day
+- **Polygon.io**: https://polygon.io/dashboard/signup → free key, 5 calls/min
 
-| Variable | Description |
-|---|---|
-| `TELEGRAM_TOKEN` | Your Telegram bot token from [@BotFather](https://t.me/BotFather) |
-| `TELEGRAM_CHAT` | Your chat ID (use [@userinfobot](https://t.me/userinfobot) to find it) |
-| `BENZINGA_KEY` | Benzinga Pro API key (optional) |
+### 2. Railway Env Vars
 
-### 2. Install & Run Locally
-
-```bash
-pip install -r requirements.txt
-python main.py
+```
+TELEGRAM_TOKEN=your_bot_token
+TELEGRAM_CHAT=your_chat_id
+FINNHUB_KEY=your_finnhub_key
+NEWSAPI_KEY=your_newsapi_key       # optional
+POLYGON_KEY=your_polygon_key       # optional
 ```
 
-### 3. Deploy to Heroku / Railway
+### 3. Deploy
 
-The included `Procfile` works with Heroku:
+Push to GitHub → connect to Railway → set env vars → deploy.
 
-```bash
-heroku create my-news-bot
-heroku config:set TELEGRAM_TOKEN=your_token
-heroku config:set TELEGRAM_CHAT=your_chat_id
-heroku config:set BENZINGA_KEY=your_key
-git push heroku main
-heroku ps:scale worker=1
-```
+Railway `Procfile` uses `worker` process (not `web`) so it stays alive.
 
-## How It Works
+## Customize
 
-1. Every **60 seconds**, fetches the latest headlines from all RSS feeds
-2. Filters against **60+ keywords** for trading relevance
-3. Deduplicates using MD5 hashes stored in `seen_hashes.json`
-4. Sends matching headlines to your Telegram chat
-5. At **4:00 PM IST**, posts FII/DII institutional data from NSE
-6. At **8:00 AM IST**, posts a feed health report
-
-## Adding/Removing Feeds
-
-Edit the `FEEDS` dictionary in `main.py`:
-
-```python
-FEEDS = {
-    'Source Name': 'https://example.com/rss/feed.xml',
-    ...
-}
-```
-
-## Adding Keywords
-
-Edit the `KEYWORDS` list in `main.py`. Keywords are matched case-insensitively against headline titles.
+- **Add tickers**: Edit `US_TICKERS` and `INDIA_SYMBOLS` in `main.py`
+- **Add keywords**: Edit `KEYWORDS` list
+- **Change intervals**: Edit `FINNHUB_INTERVAL`, `NEWSAPI_INTERVAL`, `POLYGON_INTERVAL`
+- **FII/DII time**: Adjust `FIIDII_HOUR_UTC` and `FIIDII_MINUTE_UTC`
