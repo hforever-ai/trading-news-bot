@@ -4,16 +4,19 @@ Trading News Bot v2 — API-First Architecture
 Sources: Finnhub (primary), NewsAPI (secondary), Polygon.io (tertiary)
 No RSS feeds. Real-time API polling with smart dedup.
 
-Deploy on Railway with these env vars:
+Deploy on Oracle Cloud / Railway with these env vars:
   TELEGRAM_TOKEN, TELEGRAM_CHAT,
   FINNHUB_KEY, NEWSAPI_KEY, POLYGON_KEY  (at least one required)
 """
+
+from dotenv import load_dotenv
+import os
+load_dotenv(os.path.join(os.path.dirname(os.path.abspath(__file__)), '.env'))
 
 import requests
 import time
 import hashlib
 import json
-import os
 import re
 from datetime import datetime, timedelta, timezone
 from difflib import SequenceMatcher
@@ -28,46 +31,40 @@ NEWSAPI_KEY  = os.environ.get('NEWSAPI_KEY', '')      # Free: 100 calls/day
 POLYGON_KEY  = os.environ.get('POLYGON_KEY', '')      # Free: 5 calls/min
 
 # ─── TIMING (seconds) ──────────────────────────────────────────────
-FINNHUB_INTERVAL  = 30     # Poll Finnhub every 30s
-NEWSAPI_INTERVAL  = 300    # Poll NewsAPI every 5 min (save daily quota)
-POLYGON_INTERVAL  = 120    # Poll Polygon every 2 min
-FIIDII_HOUR_UTC   = 10     # 4:00 PM IST = 10:30 UTC
+FINNHUB_INTERVAL  = 30
+NEWSAPI_INTERVAL  = 300
+POLYGON_INTERVAL  = 120
+FIIDII_HOUR_UTC   = 10
 FIIDII_MINUTE_UTC = 30
 
 # ─── KEYWORDS (US + Indian Markets) ────────────────────────────────
 KEYWORDS = [
-    # General market
     'stock', 'market', 'earnings', 'trading', 'investor', 'wall street',
     'bull', 'bear', 'rally', 'plunge', 'surge', 'crash', 'selloff',
     'sell-off', 'downturn', 'rebound', 'correction', 'volatility',
-    # US specific
     'fed', 'federal reserve', 'fomc', 'nasdaq', 'dow jones', 's&p 500',
     's&p500', 'nyse', 'treasury', 'rate hike', 'rate cut', 'interest rate',
     'inflation', 'cpi', 'ppi', 'jobs report', 'nonfarm', 'gdp',
     'recession', 'stimulus', 'debt ceiling',
-    # Indian specific
     'nifty', 'sensex', 'bse', 'nse', 'banknifty', 'bank nifty',
     'rbi', 'sebi', 'fii', 'dii', 'rupee', 'nifty50',
     'adani', 'reliance', 'tata', 'infosys', 'hdfc', 'icici',
-    # Corporate / deal activity
     'ipo', 'merger', 'acquisition', 'takeover', 'buyout', 'spinoff',
     'bankruptcy', 'dividend', 'buyback', 'stock split',
     'sec filing', 'quarterly results',
-    # Macro / trade
     'tariff', 'trade war', 'sanctions', 'oil price', 'crude oil',
     'gold price', 'bond yield', 'dollar index',
 ]
 
-# Tickers to track on Finnhub (batched to stay within rate limits)
 US_TICKERS = ['AAPL', 'MSFT', 'GOOGL', 'AMZN', 'TSLA', 'NVDA', 'META', 'SPY', 'QQQ']
 INDIA_SYMBOLS = ['RELIANCE', 'TCS', 'INFY', 'HDFCBANK', 'ICICIBANK', 'ADANIENT', 'TATAMOTORS', 'SBIN']
 
 # ─── DEDUP ENGINE ──────────────────────────────────────────────────
-SEEN_FILE   = 'seen_hashes.json'
+SEEN_FILE   = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'seen_hashes.json')
 MAX_SEEN    = 8000
-TITLE_CACHE = []           # recent titles for fuzzy matching
+TITLE_CACHE = []
 MAX_TITLE_CACHE = 500
-SIMILARITY_THRESHOLD = 0.82  # titles >82% similar = duplicate
+SIMILARITY_THRESHOLD = 0.82
 
 def load_seen() -> set:
     try:
@@ -90,12 +87,10 @@ def save_seen(seen_set: set):
 seen = load_seen()
 
 def make_hash(title: str, url: str = '') -> str:
-    """Create dedup hash from normalized title + url."""
     clean = re.sub(r'\s+', ' ', title.strip().lower())
     return hashlib.md5((clean + url).encode()).hexdigest()
 
 def is_fuzzy_duplicate(title: str) -> bool:
-    """Check if title is too similar to a recently sent headline."""
     clean = re.sub(r'\s+', ' ', title.strip().lower())
     for cached in TITLE_CACHE[-MAX_TITLE_CACHE:]:
         if SequenceMatcher(None, clean, cached).ratio() > SIMILARITY_THRESHOLD:
@@ -103,7 +98,6 @@ def is_fuzzy_duplicate(title: str) -> bool:
     return False
 
 def mark_sent(title: str, h: str):
-    """Mark a headline as sent (hash + title cache)."""
     seen.add(h)
     clean = re.sub(r'\s+', ' ', title.strip().lower())
     TITLE_CACHE.append(clean)
@@ -116,7 +110,6 @@ def matches_keywords(title: str) -> bool:
     return any(kw in t for kw in KEYWORDS)
 
 def categorize(title: str) -> str:
-    """Return an emoji category tag for the headline."""
     t = title.lower()
     if any(k in t for k in ['nifty', 'sensex', 'bse', 'nse', 'rbi', 'sebi', 'fii', 'dii', 'rupee',
                              'adani', 'reliance', 'tata', 'infosys', 'hdfc', 'icici']):
@@ -170,7 +163,6 @@ def tg(msg: str):
             time.sleep(2)
 
 def send_headline(source: str, title: str, url: str = '', summary: str = ''):
-    """Format and send a single headline to Telegram."""
     cat = categorize(title)
     parts = [f'{cat} <b>[{source}]</b>', title]
     if summary:
@@ -178,14 +170,13 @@ def send_headline(source: str, title: str, url: str = '', summary: str = ''):
     if url:
         parts.append(url)
     tg('\n'.join(parts))
-    time.sleep(0.4)  # avoid TG flood
+    time.sleep(0.4)
 
 # ═══════════════════════════════════════════════════════════════════
-#  SOURCE 1: FINNHUB  (Primary — fast, high rate limit)
+#  SOURCE 1: FINNHUB
 # ═══════════════════════════════════════════════════════════════════
 
 def fetch_finnhub_general():
-    """Fetch general market news from Finnhub."""
     if not FINNHUB_KEY:
         return 0
     count = 0
@@ -219,14 +210,13 @@ def fetch_finnhub_general():
                 send_headline('Finnhub', title, url, summary)
                 count += 1
             else:
-                seen.add(h)  # mark seen even if not matching
+                seen.add(h)
 
     except Exception as e:
         log(f'Finnhub general err: {e}')
     return count
 
 def fetch_finnhub_ticker(symbols: list, batch_label: str = ''):
-    """Fetch company-specific news from Finnhub for given symbols."""
     if not FINNHUB_KEY:
         return 0
     count = 0
@@ -238,9 +228,7 @@ def fetch_finnhub_ticker(symbols: list, batch_label: str = ''):
             r = requests.get(
                 'https://finnhub.io/api/v1/company-news',
                 params={
-                    'symbol': sym,
-                    'from': week_ago,
-                    'to': today,
+                    'symbol': sym, 'from': week_ago, 'to': today,
                     'token': FINNHUB_KEY,
                 },
                 timeout=15,
@@ -265,20 +253,17 @@ def fetch_finnhub_ticker(symbols: list, batch_label: str = ''):
                 send_headline(f'Finnhub/{sym}', title, url, summary)
                 count += 1
 
-            time.sleep(0.3)  # pace API calls
+            time.sleep(0.3)
         except Exception as e:
             log(f'Finnhub ticker {sym} err: {e}')
     return count
 
-# Batch tickers across cycles to stay within Finnhub free tier
 _finnhub_ticker_cycle = 0
 
 def fetch_finnhub():
-    """Run Finnhub: general news every cycle, tickers batched across 4 cycles."""
     global _finnhub_ticker_cycle
     total = fetch_finnhub_general()
 
-    # Rotate through ticker batches: US batch 1, US batch 2, India batch 1, India batch 2
     batches = [
         (US_TICKERS[:5],  'US-1'),
         (US_TICKERS[5:],  'US-2'),
@@ -294,12 +279,10 @@ def fetch_finnhub():
         log(f'Finnhub: sent {total} headlines (ticker batch {label})')
     return total
 
-
 # ═══════════════════════════════════════════════════════════════════
-#  SOURCE 2: NEWSAPI  (Secondary — broad coverage, lower quota)
+#  SOURCE 2: NEWSAPI
 # ═══════════════════════════════════════════════════════════════════
 
-# Rotate queries to maximize coverage within 100/day free limit
 NEWSAPI_QUERIES = [
     'stock market today',
     'federal reserve interest rate',
@@ -313,7 +296,6 @@ NEWSAPI_QUERIES = [
 _newsapi_query_idx = 0
 
 def fetch_newsapi():
-    """Fetch headlines from NewsAPI (rotates queries to save quota)."""
     global _newsapi_query_idx
     if not NEWSAPI_KEY:
         return 0
@@ -325,10 +307,8 @@ def fetch_newsapi():
         r = requests.get(
             'https://newsapi.org/v2/everything',
             params={
-                'q': query,
-                'sortBy': 'publishedAt',
-                'language': 'en',
-                'pageSize': 10,
+                'q': query, 'sortBy': 'publishedAt',
+                'language': 'en', 'pageSize': 10,
                 'apiKey': NEWSAPI_KEY,
             },
             timeout=15,
@@ -362,15 +342,13 @@ def fetch_newsapi():
         log(f'NewsAPI ({query[:30]}): sent {count} headlines')
     return count
 
-
 # ═══════════════════════════════════════════════════════════════════
-#  SOURCE 3: POLYGON.IO  (Tertiary — ticker-specific, free tier)
+#  SOURCE 3: POLYGON.IO
 # ═══════════════════════════════════════════════════════════════════
 
 _polygon_ticker_idx = 0
 
 def fetch_polygon():
-    """Fetch ticker news from Polygon.io (rotates tickers to save quota)."""
     global _polygon_ticker_idx
     if not POLYGON_KEY:
         return 0
@@ -384,10 +362,8 @@ def fetch_polygon():
         r = requests.get(
             f'https://api.polygon.io/v2/reference/news',
             params={
-                'ticker': ticker,
-                'limit': 5,
-                'order': 'desc',
-                'sort': 'published_utc',
+                'ticker': ticker, 'limit': 5,
+                'order': 'desc', 'sort': 'published_utc',
                 'apiKey': POLYGON_KEY,
             },
             timeout=15,
@@ -421,9 +397,8 @@ def fetch_polygon():
         log(f'Polygon ({ticker}): sent {count} headlines')
     return count
 
-
 # ═══════════════════════════════════════════════════════════════════
-#  FII/DII DAILY REPORT  (NSE India scrape)
+#  FII/DII DAILY REPORT
 # ═══════════════════════════════════════════════════════════════════
 
 def fetch_fiidii():
@@ -480,13 +455,11 @@ def fetch_fiidii():
     except Exception as e:
         log(f'FII/DII err: {e}')
 
-
 # ═══════════════════════════════════════════════════════════════════
-#  MAIN LOOP — Multi-source scheduler
+#  MAIN LOOP
 # ═══════════════════════════════════════════════════════════════════
 
 def startup_message():
-    """Send bot status on startup."""
     sources = []
     if FINNHUB_KEY:
         sources.append('Finnhub (every 30s)')
@@ -496,8 +469,8 @@ def startup_message():
         sources.append('Polygon.io (every 2min)')
 
     if not sources:
-        log('⚠️  NO API KEYS SET! Set at least one: FINNHUB_KEY, NEWSAPI_KEY, POLYGON_KEY')
-        tg('⚠️ Bot started but NO API keys configured!\nSet env vars: FINNHUB_KEY, NEWSAPI_KEY, POLYGON_KEY')
+        log('⚠️  NO API KEYS SET!')
+        tg('⚠️ Bot started but NO API keys configured!')
         return
 
     tg(
@@ -513,11 +486,6 @@ def startup_message():
 
 
 def cold_start():
-    """
-    CRITICAL FIX: On first run, silently index all current headlines
-    so we only send NEW ones from the next cycle onward.
-    This prevents the "spam dump on boot" problem.
-    """
     global seen
     if os.path.exists(SEEN_FILE):
         log('Seen file exists, skipping cold start')
@@ -526,12 +494,10 @@ def cold_start():
     log('Cold start: indexing existing headlines (no sends)...')
     original_tg = globals()['tg']
 
-    # Temporarily disable Telegram sends
     def noop_tg(msg):
         pass
     globals()['tg'] = noop_tg
 
-    # Run all sources once to populate seen set
     if FINNHUB_KEY:
         fetch_finnhub()
         log(f'  Finnhub indexed ({len(seen)} hashes)')
@@ -542,7 +508,6 @@ def cold_start():
         fetch_polygon()
         log(f'  Polygon indexed ({len(seen)} hashes)')
 
-    # Restore Telegram
     globals()['tg'] = original_tg
     save_seen(seen)
     log(f'Cold start done. {len(seen)} headlines indexed.')
@@ -551,7 +516,6 @@ def cold_start():
 if __name__ == '__main__':
     log('News Bot v2 starting...')
 
-    # Validate config
     if not TOKEN:
         log('ERROR: TELEGRAM_TOKEN not set!')
     if not CHAT:
@@ -560,7 +524,6 @@ if __name__ == '__main__':
     startup_message()
     cold_start()
 
-    # Track last run times per source
     last_finnhub  = 0.0
     last_newsapi  = 0.0
     last_polygon  = 0.0
@@ -573,38 +536,31 @@ if __name__ == '__main__':
             utcnow = datetime.now(timezone.utc)
             total = 0
 
-            # ── Finnhub: every 30s ──
             if FINNHUB_KEY and (now - last_finnhub) >= FINNHUB_INTERVAL:
                 last_finnhub = now
                 total += fetch_finnhub()
 
-            # ── NewsAPI: every 5 min ──
             if NEWSAPI_KEY and (now - last_newsapi) >= NEWSAPI_INTERVAL:
                 last_newsapi = now
                 total += fetch_newsapi()
 
-            # ── Polygon: every 2 min ──
             if POLYGON_KEY and (now - last_polygon) >= POLYGON_INTERVAL:
                 last_polygon = now
                 total += fetch_polygon()
 
-            # ── FII/DII at 4:00 PM IST (10:30 UTC) ──
             if utcnow.hour == FIIDII_HOUR_UTC and FIIDII_MINUTE_UTC <= utcnow.minute < FIIDII_MINUTE_UTC + 5:
                 if not fii_sent:
                     fii_sent = True
                     fetch_fiidii()
 
-            # Reset daily flags at midnight UTC
             if utcnow.hour == 0 and utcnow.minute < 5:
                 fii_sent = False
 
-            # Save hashes every 5 cycles
             save_counter += 1
             if save_counter >= 5:
                 save_seen(seen)
                 save_counter = 0
 
-            # Sleep 10s between checks (sources have their own intervals)
             time.sleep(10)
 
         except KeyboardInterrupt:
